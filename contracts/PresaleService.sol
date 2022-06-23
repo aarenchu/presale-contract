@@ -5,8 +5,7 @@ import "hardhat/console.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
-import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
-import "@uniswap/v3-periphery/contracts/libraries/TransferHelper.sol";
+import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
 /**
  * @title A general presale service
@@ -25,19 +24,29 @@ contract PresaleService is AccessControl {
         address token;
         bool buyUnlocked;
         bool withdrawUnlocked;
+        bool isEnded;
     }
     mapping(uint256 => Presale) public presaleIdToPresale;
     Counters.Counter private presaleIds;
     uint256 private usageFee;
     bytes32 public constant ROLE_ADMIN = keccak256("ROLE_ADMIN");
+    IUniswapV2Router02 public uniswap;
 
-    constructor(uint256 _usageFee) {
+    /**
+     * Constructor
+     *
+     * @param _uniswap address of uniswap contract instance
+     * @param _usageFee cost of usage fee, will be converted to bps
+     */
+    constructor(address _uniswap, uint256 _usageFee) {
         /// @dev set up admin address
         _grantRole(ROLE_ADMIN, msg.sender);
         _setRoleAdmin(ROLE_ADMIN, ROLE_ADMIN);
         /// @dev set up usage fee bp
         /// TODO: Check if this is correct
-        /// usageFee = _usageFee / 10000;
+        usageFee = _usageFee / 10000;
+        /// @dev set up uniswap
+        uniswap = IUniswapV2Router02(_uniswap);
     }
 
     /**
@@ -84,6 +93,7 @@ contract PresaleService is AccessControl {
                 tokenAmtMantissas[i],
                 token,
                 false,
+                false,
                 false
             );
             /// @dev TODO run??
@@ -109,7 +119,7 @@ contract PresaleService is AccessControl {
      */
     function _runPresale(uint256 presaleId) private {
         /// @dev get Presale
-        Presale memory ps = presaleIdToPresale[presaleId];
+        Presale storage ps = presaleIdToPresale[presaleId];
         /// @dev user sends tokens to contract
         IERC20(ps.token).transferFrom(
             msg.sender,
@@ -125,8 +135,10 @@ contract PresaleService is AccessControl {
             ps.buyUnlocked = true;
         }
         /// @dev when end timestamp passed, withdraw functionality unlocked
-        if (block.timestamp > ps.endTimestamp) {
+        /// @dev and the sale should end
+        else if (block.timestamp > ps.endTimestamp) {
             ps.buyUnlocked = false;
+            endPresale(presaleId, ps.token);
             ps.withdrawUnlocked = true;
         }
     }
@@ -135,13 +147,26 @@ contract PresaleService is AccessControl {
      * Exchange ETH for ERC20 token.
      *
      * @param presaleId presale id to exchange ETH for ERC20 tokens
+     * @param tokenAmtMantissa amount of tokens to receive
      *
      * REQ: Buy functionality of presale is unlocked
      */
-    function buy(uint256 presaleId) external {
+    function buy(uint256 presaleId, uint256 tokenAmtMantissa) external {
         /// @dev get Presale
-        Presale memory ps = presaleIdToPresale[presaleId];
+        Presale storage ps = presaleIdToPresale[presaleId];
         require(ps.buyUnlocked, "Buy functionality locked");
+        address[] memory path = new address[](2);
+        /// @dev first element is what you spend, second is what you get in return
+        path[0] = uniswap.WETH();
+        path[1] = ps.token;
+        uniswap.swapETHForExactTokens(
+            tokenAmtMantissa,
+            path,
+            msg.sender,
+            ps.endTimestamp
+        );
+        /// @dev update token mantissa
+        ps.tokenAmtMantissa = ps.tokenAmtMantissa - tokenAmtMantissa;
     }
 
     /**
@@ -149,12 +174,17 @@ contract PresaleService is AccessControl {
      *
      * @param presaleId id of ended presale
      *
+     * REQ: Presale is ended
      * REQ: Withdraw functionality of presale is unlocked
      */
     function withdraw(uint256 presaleId) external {
         /// @dev get Presale
         Presale memory ps = presaleIdToPresale[presaleId];
+        require(ps.isEnded, "Presale is still active");
         require(ps.withdrawUnlocked, "Withdraw functionality locked");
+        /// @dev don't waste gas transferring nothing
+        if (ps.tokenAmtMantissa > 0)
+            IERC20(ps.token).transfer(msg.sender, ps.tokenAmtMantissa);
     }
 
     /**
@@ -166,9 +196,9 @@ contract PresaleService is AccessControl {
      * REQ: end timestamp has passed
      * REQ: token must be the same as presale.
      */
-    function endPresale(uint256 presaleId, address token) external {
+    function endPresale(uint256 presaleId, address token) public {
         /// @dev get Presale
-        Presale memory ps = presaleIdToPresale[presaleId];
+        Presale storage ps = presaleIdToPresale[presaleId];
         require(
             block.timestamp > ps.endTimestamp,
             "Presale end timestamp not passed"
@@ -181,14 +211,21 @@ contract PresaleService is AccessControl {
         /// @dev both the token and ETH will be sent to uniswap as liquidity to create a trading pair.
 
         /// @dev Some ETH will go to the admin address based on the usage fee bp
+
+        /// @dev Notify presale is ended
+        ps.isEnded = true;
+        /// @dev reset counter??
     }
 
     /**
      * Change usage fee
-     * @dev TODO set up basis points
+     *
+     * @param _usageFee new usage fee to be converted to bps
+     *
      * REQ: Must be admin
      */
     function changeUsageFee(uint256 _usageFee) external onlyRole(ROLE_ADMIN) {
-        usageFee = _usageFee;
+        /// @dev set up basis points
+        usageFee = _usageFee / 10000;
     }
 }
